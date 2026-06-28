@@ -1,0 +1,1549 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>湘南新宿ライン 沿線ナビ (GPS/デモハイブリッド)</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- FontAwesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700;900&family=Roboto+Mono:wght@500;700&display=swap" rel="stylesheet">
+    <!-- Leaflet.js -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Noto Sans JP', 'sans-serif'],
+                        mono: ['Roboto Mono', 'monospace'],
+                    },
+                    colors: {
+                        appDark: '#000000',
+                        appCard: '#121826', /* より明瞭な色彩のためにカード背景を少し明るく調整 */
+                        appBorder: '#23304a', /* ボーダー線をくっきり見せるように調整 */
+                        railBlue: '#2563eb',
+                        railRed: '#e60012',
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body {
+            font-family: 'Noto Sans JP', sans-serif;
+            background-color: #000000;
+            -webkit-tap-highlight-color: transparent;
+            overflow: hidden;
+            /* iOSセーフエリア対策 */
+            padding-top: env(safe-area-inset-top);
+            padding-bottom: env(safe-area-inset-bottom);
+        }
+        /* スクロールバー非表示 */
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+        /* カード短文の簡易表示（2行でクランプ。続きは「詳細を見る」で全文） */
+        .clamp-2 {
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+        
+        /* 地図の周辺影効果 */
+        .map-shadow {
+            box-shadow: inset 0 0 20px rgba(0,0,0,0.85);
+            pointer-events: none;
+            z-index: 1000;
+        }
+
+        /* 進行方向を上にするためのLeafletコンテナ回転のベーススタイル */
+        .rotated-map .leaflet-map-pane {
+            transform-origin: center;
+            transition: transform 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+        }
+
+        /* 💡 地図を進行方向に回転させた際、四隅にタイル未描画の黒い三角が出るのを防ぐ。
+           表示枠(h-170)より大きく地図本体を確保し、回転してもタイルが常に枠を覆うようにする
+           （中心は表示枠中央に一致させる。スマホ幅向けに各辺220px拡張） */
+        #map.rotated-map {
+            position: absolute;
+            top: -220px;
+            left: -220px;
+            width: calc(100% + 440px);
+            height: calc(100% + 440px);
+        }
+
+        /* アイコンが地図と一緒に回転して傾くのを防ぐための補正 */
+        .rotated-map .leaflet-marker-icon .fix-rotate {
+            transition: transform 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+            transform-origin: center;
+        }
+
+        /* 現在地ナビ矢印のアニメーション
+           ※ 軸への中央寄せ(translateX(-50%))をキーフレーム内に含める。
+              含めないと scale/translateY が translate を打ち消し、脈動のたびに横へずれて線から外れる */
+        @keyframes pulse-arrow {
+            0%, 100% { transform: translateX(-50%) translateY(0) scale(1); opacity: 1; }
+            50%      { transform: translateX(-50%) translateY(1.5px) scale(1.12); opacity: 0.82; }
+        }
+        .current-location-pulse {
+            animation: pulse-arrow 1.6s infinite ease-in-out;
+            /* translateX はアニメ側で担保するため、translate-x-1/2 クラスへの依存を解消 */
+            left: 12px;
+        }
+    </style>
+</head>
+<body class="w-full h-[100dvh] bg-appDark text-slate-100 flex flex-col justify-between overflow-hidden">
+
+    <!-- 💡 東海道線オレンジライン (最上部固定) -->
+    <div class="w-full h-[5px] bg-railRed shrink-0"></div>
+
+    <!-- 1. 最上部ヘッダー部 -->
+    <div class="bg-appDark pt-1.5 px-4 pb-1 z-20 shrink-0 select-none">
+        
+        <!-- 1.1 路線名、GPS/デモ切り替えスイッチ -->
+        <div class="flex items-center justify-between mb-1">
+            <div class="flex items-center gap-1.5">
+                <!-- JTアイコン: オレンジフチを少し太く(border-[2.5px])、外枠を文字サイズぎりぎりまでコンパクト化(w-[20px] h-[20px]) -->
+                <div class="w-[20px] h-[20px] bg-white border-[2.5px] border-red-600 rounded flex items-center justify-center shadow-sm shrink-0">
+                    <span class="text-appDark font-black text-[10px] font-mono tracking-tighter leading-none">JS</span>
+                </div>
+                <h1 class="text-[13px] font-black tracking-wide text-white">湘南新宿ライン（JR東日本）</h1>
+            </div>
+            
+            <!-- GPS/デモスイッチ -->
+            <div class="flex bg-slate-900 border border-slate-700/50 p-0.5 rounded-lg text-[9px]">
+                <button id="toggle-gps" onclick="setMode('gps')" class="px-2.5 py-0.5 rounded font-bold transition-all text-slate-400">
+                    GPS
+                </button>
+                <button id="toggle-demo" onclick="setMode('demo')" class="px-2.5 py-0.5 rounded font-bold transition-all bg-railBlue text-white shadow">
+                    デモ
+                </button>
+            </div>
+        </div>
+
+        <!-- 1.2 全体距離・進捗プログレスバー -->
+        <div class="relative w-full h-1 bg-slate-800 rounded-full mb-1 mt-1.5">
+            <div id="ui-main-progress" class="absolute h-full bg-railBlue rounded-full" style="width: 0%;"></div>
+            <div id="ui-progress-dot" class="absolute w-2.5 h-2.5 bg-white rounded-full top-1/2 -translate-y-1/2 shadow-[0_0_6px_#fff]" style="left: 0%;"></div>
+            <span id="ui-distance-label" class="absolute right-0 -top-4 text-[9px] text-blue-400 font-mono font-bold">0.0km</span>
+            <div class="absolute w-full flex justify-between top-1.5 px-0.5 text-[8px] text-slate-500 font-medium">
+                <span class="text-blue-500 font-bold">大宮</span>
+                <span>赤羽</span>
+                <span>新宿</span>
+                <span>横浜</span>
+                <span>大船</span>
+                <div class="text-right">
+                    <span class="block text-slate-400">逗子</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- 1.3 駅切り替え表示部 (前駅左寄せ・次駅右寄せの使いやすい元の左右スプリット配置へ復旧) -->
+        <div id="ui-station-header-container" class="pt-2 pb-1 min-h-[48px] flex items-center w-full">
+            <!-- デフォルト状態: 駅間走行表示（元の使いやすい左右寄せ配置） -->
+            <div id="header-running-view" class="flex justify-between items-center w-full">
+                <!-- 左：前駅 (左寄せ左揃え) -->
+                <div class="flex flex-col items-start w-[45%]">
+                    <span id="ui-prev-rubi" class="text-[8px] text-slate-400 font-medium tracking-wider text-left">おおみや</span>
+                    <h2 id="ui-prev-name" class="text-lg font-black text-white tracking-tight text-left truncate w-full">大宮</h2>
+                    <span id="ui-prev-id" class="text-[9px] text-slate-500 font-mono font-bold text-left">JS-24</span>
+                </div>
+                <!-- 中央：矢印 (中央配置) -->
+                <div class="text-railBlue px-2">
+                    <i class="fa-solid fa-chevron-right text-sm animate-pulse"></i>
+                </div>
+                <!-- 右：次駅 (右寄せ右揃え) -->
+                <div class="flex flex-col items-end w-[45%]">
+                    <span id="ui-next-rubi" class="text-[8px] text-slate-400 font-medium tracking-wider text-right">うらわ</span>
+                    <h2 id="ui-next-name" class="text-lg font-black text-white tracking-tight text-right truncate w-full">浦和</h2>
+                    <span id="ui-next-id" class="text-[9px] text-slate-500 font-mono font-bold text-right">JS-23</span>
+                </div>
+            </div>
+
+            <!-- 到着時状態: 1駅特化＋解説スライダー (「●停車中」表示を廃止し、左側を少し縮小して駅紹介を左側に大きく拡大) -->
+            <div id="header-stopped-view" class="hidden justify-between items-center w-full">
+                <!-- 現在停車中の駅名表示 (左揃え・停車中の文言は消去・横幅を縮めて見切れを完全解消) -->
+                <div class="flex flex-col items-start w-[35%] shrink-0 pr-2">
+                    <span id="ui-current-rubi" class="text-[8px] text-slate-400 font-medium tracking-wider text-left">おおみや</span>
+                    <h2 id="ui-current-name" class="text-xl font-black text-white tracking-tight text-left truncate w-full leading-tight">大宮</h2>
+                    <span id="ui-current-id" class="text-[9px] text-slate-500 font-mono font-bold text-left">JS-24</span>
+                </div>
+                <!-- 右：駅紹介カード (「駅のごご紹介」見出しとアイコンを全廃してすっきりさせ、左側に大きく拡大) -->
+                <div class="flex-grow bg-slate-900 border border-railRed/35 rounded-lg p-1.5 flex flex-col justify-center h-[42px] overflow-y-auto no-scrollbar">
+                    <p id="ui-station-intro" class="text-[9.5px] text-slate-100 leading-snug font-medium">新幹線が集結する北関東最大級のターミナル。湘南新宿ラインの北の起点。</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- 1.4 3連ステータスカード (1行目にタイトル、2行目に内容の配置。高さは極限まで短縮) -->
+        <div class="grid grid-cols-12 gap-1.5 mt-1">
+            <!-- 現在地カード -->
+            <div class="col-span-6 bg-appCard border border-appBorder rounded-lg px-1.5 py-0.5 flex flex-col justify-center items-center text-center h-[30px]">
+                <span class="text-[7.5px] text-slate-400 font-medium flex items-center gap-0.5 leading-none"><i class="fa-solid fa-location-dot text-slate-500"></i>現在地</span>
+                <div id="ui-city-name" class="text-[9px] font-black text-slate-100 whitespace-nowrap overflow-hidden text-ellipsis w-full mt-0.5 leading-none">埼玉県さいたま市大宮区</div>
+            </div>
+            <!-- 速度カード -->
+            <div class="col-span-3 bg-appCard border border-appBorder rounded-lg px-1.5 py-0.5 flex flex-col justify-center items-center text-center h-[30px]">
+                <span class="text-[7.5px] text-slate-400 font-medium flex items-center gap-0.5 leading-none"><i class="fa-solid fa-gauge-high text-slate-500"></i>速度</span>
+                <div class="text-[9px] font-mono font-black text-slate-100 mt-0.5 leading-none"><span id="ui-speed">0</span><span class="text-[7.5px] font-sans font-normal text-slate-400 ml-0.5">km</span></div>
+            </div>
+            <!-- GPSカード -->
+            <div class="col-span-3 bg-appCard border border-appBorder rounded-lg px-1.5 py-0.5 flex flex-col justify-center items-center text-center h-[30px]">
+                <span class="text-[7.5px] text-slate-400 font-medium flex items-center gap-0.5 leading-none"><i class="fa-solid fa-satellite-dish text-slate-500"></i>GPS</span>
+                <div id="ui-gps-badge" class="text-[8px] font-bold text-blue-400 bg-blue-500/5 border border-blue-500/10 px-1 rounded w-full mt-0.5 text-center leading-none">デモ</div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- 2. 地図ビュー (デモ操作フローティング + 手動操作対応) -->
+    <div class="relative h-[170px] w-full z-10 border-y border-appBorder overflow-hidden shrink-0">
+        <div id="map" class="w-full h-full bg-slate-950 rotated-map"></div>
+        <div class="map-shadow absolute inset-0"></div>
+        
+        <!-- フローティングデモコントローラー -->
+        <div id="demo-ctrl-bar" class="absolute top-2 left-2 right-2 z-[1000] bg-[#000000]/85 backdrop-blur-md border border-slate-800 rounded-xl p-1.5 flex items-center justify-between gap-2.5 shadow-lg">
+            <div class="flex items-center gap-1.5 shrink-0">
+                <button id="btn-play-demo" onclick="toggleDemoPlay()" class="w-6 h-6 bg-railBlue rounded-full flex items-center justify-center hover:scale-105 active:scale-95 transition-all">
+                    <i id="icon-play-demo" class="fa-solid fa-play text-[9px] text-white"></i>
+                </button>
+                <span class="text-[9px] text-slate-400 font-bold" id="demo-status-label">デモ 6x</span>
+            </div>
+            <input type="range" id="demo-slider" min="0" max="85.7" step="0.1" value="0" oninput="onDemoSliderChange(this.value)" class="flex-grow accent-railBlue bg-slate-800 rounded-lg appearance-none h-1 cursor-pointer">
+            <span class="text-[9px] text-blue-400 font-mono font-bold shrink-0" id="demo-km-label">0.0km</span>
+        </div>
+
+        <!-- 進行方向インジケータ兼「現在地追従復帰ボタン」 (右下のナビ矢印マークが常に真上を指すように、アイコン自体の向きを補正) -->
+        <button id="compass-indicator" onclick="resetMapTracking()" class="absolute bottom-2 right-2 z-[1000] bg-slate-900/90 border border-slate-700 hover:border-railRed w-8 h-8 rounded-lg flex items-center justify-center text-railRed shadow-md transition-all active:scale-90" title="現在地に戻す">
+            <span id="compass-icon-wrapper" class="transform -rotate-45" style="display: inline-block;">
+                <i class="fa-solid fa-location-arrow text-xs"></i>
+            </span>
+            <span id="tracking-warning-pulse" class="absolute inset-0 rounded-lg border border-railRed animate-ping opacity-0"></span>
+        </button>
+    </div>
+
+    <!-- 3. 下部エリア -->
+    <div class="flex-grow flex flex-col overflow-hidden bg-gradient-to-b from-appDark to-[#05080e] pb-1.5 space-y-2">
+        
+        <!-- 沿線スポットセクション (横スクロール。不透明度を80%に向上させ、色合いを格段にはっきりクッキリと調整) -->
+        <div class="shrink-0 pt-2">
+            <div id="scenic-card-container" class="flex gap-2.5 overflow-x-auto px-4 pb-1 no-scrollbar snap-x scroll-smooth">
+                <!-- カードは SPOTS 配列から renderSpotCards() で自動生成 -->
+            </div>
+            <!-- 💡 詳細を一括でしまえる一括格納バー (文字は「折りたたむ」のみ、アイコンは逆三角caret-up) -->
+            <div id="collapse-all-bar" class="hidden justify-center items-center py-1 cursor-pointer hover:bg-slate-900/50 transition-all border-b border-appBorder" onclick="collapseAllScenicCards()">
+                <div class="flex items-center gap-1.5 text-[9px] text-slate-400 font-bold">
+                    <span class="w-12 h-[1px] bg-slate-800"></span>
+                    <i class="fa-solid fa-caret-up text-[11px] text-railRed"></i>
+                    <span>折りたたむ</span>
+                    <span class="w-12 h-[1px] bg-slate-800"></span>
+                </div>
+            </div>
+        </div>
+
+        <!-- 4. 停車駅タイムライン -->
+        <div class="flex-grow flex flex-col min-h-0 px-4">
+            <!-- タイムラインコンテナ -->
+            <div class="flex-grow overflow-y-auto pr-1 relative no-scrollbar" id="station-timeline-container">
+                <div class="relative py-1" id="station-timeline">
+                    
+                    <!-- 縦線ライン (左位置のズレを完璧に調整して left-[12px] に配置し、現在地マークと完璧に直結させます) -->
+                    <div class="absolute left-[12px] top-0 bottom-0 w-[2px] bg-slate-800 z-0"></div>
+
+                    <!-- 21駅リストコンテナ -->
+                    <div id="timeline-stations" class="space-y-1.5"></div>
+
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- 通知モーダル/トースト -->
+    <div id="app-toast" class="fixed bottom-4 left-1/2 -translate-x-1/2 bg-slate-900/95 border border-slate-700 text-white text-xs px-4 py-2.5 rounded-xl shadow-2xl z-[9999] opacity-0 pointer-events-none transition-all duration-300 flex items-center gap-2">
+        <i class="fa-solid fa-circle-info text-blue-400" id="toast-icon"></i>
+        <span id="toast-message">メッセージ</span>
+    </div>
+
+    <!-- データベース・ロジック -->
+    <script>
+        // 東海道本線（東京〜熱海）全21駅の座標定義 ＆ 各駅紹介データ
+        var stations = [
+            { id: "JS-24", name: "大宮", rubi: "おおみや", km: 0.0, coords: [35.906222, 139.623889], city: "埼玉県さいたま市大宮区", intro: "新幹線が集結する北関東最大級のターミナル。鉄道博物館（てっぱく）の最寄りでもある「鉄道の街」であり、湘南新宿ラインの北の起点。" },
+            { id: "JS-23", name: "浦和", rubi: "うらわ", km: 5.3, coords: [35.865695, 139.657135], city: "埼玉県さいたま市浦和区", intro: "埼玉県の県庁所在地・さいたま市浦和区の中心。古くからの文教都市であり、Jリーグ・浦和レッズの本拠地「サッカーの街」としても全国に知られる。" },
+            { id: "JS-22", name: "赤羽", rubi: "あかばね", km: 17.1, coords: [35.777843, 139.720821], city: "東京都北区", intro: "宇都宮線・高崎線・京浜東北線・埼京線などが交わる北区最大のジャンクション。「センベロ」の聖地と呼ばれる活気あふれる飲み屋街でも有名。" },
+            { id: "JS-21", name: "池袋", rubi: "いけぶくろ", km: 22.7, coords: [35.728926, 139.71038], city: "東京都豊島区", intro: "新宿・渋谷と並ぶ三大副都心の一角。西武・東武の二大百貨店が向かい合い、サンシャインシティを擁する巨大繁華街。" },
+            { id: "JS-20", name: "新宿", rubi: "しんじゅく", km: 27.3, coords: [35.689607, 139.700571], city: "東京都新宿区", intro: "世界一の乗降客数を誇る巨大ターミナル。高層ビル群と歌舞伎町を抱える、まさに東京の心臓部のひとつ。" },
+            { id: "JS-19", name: "渋谷", rubi: "しぶや", km: 30.8, coords: [35.658871, 139.701748], city: "東京都渋谷区", intro: "スクランブル交差点で知られる若者文化の発信地。2020年に湘南新宿ラインのホームが埼京線と並ぶ位置へ大きく移設された。" },
+            { id: "JS-18", name: "恵比寿", rubi: "えびす", km: 32.2, coords: [35.646685, 139.710033], city: "東京都渋谷区", intro: "ヱビスビール発祥の地。洗練された大人の街として人気が高く、恵比寿ガーデンプレイスが象徴。※特別快速は通過。" },
+            { id: "JS-17", name: "大崎", rubi: "おおさき", km: 36.0, coords: [35.619772, 139.728439], city: "東京都品川区", intro: "湘南新宿ライン・埼京線・りんかい線・相鉄直通線が交わる結節点。再開発でオフィスビルが林立するゲートシティ。" },
+            { id: "JS-16", name: "西大井", rubi: "にしおおい", km: 38.4, coords: [35.60198, 139.72279], city: "東京都品川区", intro: "品鶴線上に位置する閑静な住宅地の駅。すぐ先の蛇窪信号場では平面交差がダイヤ上のネックとなっている。" },
+            { id: "JS-15", name: "武蔵小杉", rubi: "むさしこすぎ", km: 44.7, coords: [35.576236, 139.659445], city: "神奈川県川崎市中原区", intro: "タワーマンションが林立する人気の再開発エリア。南武線・東急線などが集まり、近年乗降客が急増した。" },
+            { id: "JS-14", name: "新川崎", rubi: "しんかわさき", km: 46.9, coords: [35.556503, 139.668317], city: "神奈川県川崎市幸区", intro: "かつての新鶴見操車場の跡地に開かれた駅。隣接する新鶴見信号場は今も貨物列車の一大拠点となっている。" },
+            { id: "JS-13", name: "横浜", rubi: "よこはま", km: 59.8, coords: [35.465825, 139.622257], city: "神奈川県横浜市", intro: "東急・京急・相鉄・市営地下鉄・みなとみらい線が集う、日本有数の巨大ターミナル。みなとみらいや中華街への玄関口。" },
+            { id: "JS-10", name: "戸塚", rubi: "とつか", km: 71.8, coords: [35.400124, 139.534414], city: "神奈川県横浜市", intro: "東海道五十三次・第五の宿場町。横須賀線と東海道線が分かれる要衝で、湘南方面のベッドタウンとして発展。" },
+            { id: "JS-09", name: "大船", rubi: "おおふな", km: 77.1, coords: [35.353823, 139.531013], city: "神奈川県鎌倉市", intro: "巨大な白亜の「大船観音」が見守る街。横須賀線・根岸線・湘南モノレールが集まるジャンクション。" },
+            { id: "JS-08", name: "北鎌倉", rubi: "きたかまくら", km: 79.8, coords: [35.33635, 139.54693], city: "神奈川県鎌倉市", intro: "ホームのすぐ脇に円覚寺の総門が建つ、古都の静かな玄関口。建長寺・明月院など名刹が点在する。" },
+            { id: "JS-07", name: "鎌倉", rubi: "かまくら", km: 81.8, coords: [35.31907, 139.55028], city: "神奈川県鎌倉市", intro: "鶴岡八幡宮の門前町として栄えた古都の中心。江ノ島電鉄（江ノ電）への乗り換え駅でもある。" },
+            { id: "JS-06", name: "逗子", rubi: "ずし", km: 85.7, coords: [35.29538, 139.57972], city: "神奈川県逗子市", intro: "湘南新宿ライン（横須賀線直通）の終点。相模湾に面した逗子海岸やマリーナで知られる温暖な街。" }
+        ];
+
+        // 高精度線形 (全線補間用)
+        var trackPoints = [
+            { lat: 35.90505, lng: 139.62491, km: 0.0 },
+            { lat: 35.90402, lng: 139.62535, km: 0.121 },
+            { lat: 35.90273, lng: 139.62601, km: 0.276 },
+            { lat: 35.90163, lng: 139.62668, km: 0.413 },
+            { lat: 35.90037, lng: 139.62768, km: 0.579 },
+            { lat: 35.8993, lng: 139.62883, km: 0.737 },
+            { lat: 35.8982, lng: 139.63006, km: 0.902 },
+            { lat: 35.89732, lng: 139.63094, km: 1.028 },
+            { lat: 35.89646, lng: 139.63177, km: 1.15 },
+            { lat: 35.89546, lng: 139.63259, km: 1.283 },
+            { lat: 35.89241, lng: 139.63472, km: 1.673 },
+            { lat: 35.89128, lng: 139.63546, km: 1.815 },
+            { lat: 35.89002, lng: 139.63618, km: 1.97 },
+            { lat: 35.88883, lng: 139.63679, km: 2.113 },
+            { lat: 35.88731, lng: 139.63745, km: 2.292 },
+            { lat: 35.88623, lng: 139.63805, km: 2.424 },
+            { lat: 35.88514, lng: 139.63864, km: 2.556 },
+            { lat: 35.88361, lng: 139.63934, km: 2.738 },
+            { lat: 35.88185, lng: 139.64005, km: 2.944 },
+            { lat: 35.88036, lng: 139.64068, km: 3.119 },
+            { lat: 35.87941, lng: 139.64108, km: 3.23 },
+            { lat: 35.87801, lng: 139.64167, km: 3.395 },
+            { lat: 35.87611, lng: 139.64247, km: 3.618 },
+            { lat: 35.87494, lng: 139.64307, km: 3.759 },
+            { lat: 35.87409, lng: 139.64371, km: 3.87 },
+            { lat: 35.8729, lng: 139.64498, km: 4.045 },
+            { lat: 35.8715, lng: 139.64652, km: 4.254 },
+            { lat: 35.86971, lng: 139.64852, km: 4.522 },
+            { lat: 35.86888, lng: 139.64947, km: 4.648 },
+            { lat: 35.86775, lng: 139.65072, km: 4.817 },
+            { lat: 35.86691, lng: 139.65158, km: 4.938 },
+            { lat: 35.86603, lng: 139.65231, km: 5.057 },
+            { lat: 35.86448, lng: 139.65336, km: 5.253 },
+            { lat: 35.86222, lng: 139.65487, km: 5.539 },
+            { lat: 35.86123, lng: 139.65551, km: 5.663 },
+            { lat: 35.86017, lng: 139.65617, km: 5.795 },
+            { lat: 35.85777, lng: 139.65763, km: 6.093 },
+            { lat: 35.85665, lng: 139.65845, km: 6.238 },
+            { lat: 35.85581, lng: 139.65917, km: 6.352 },
+            { lat: 35.85475, lng: 139.66043, km: 6.515 },
+            { lat: 35.85376, lng: 139.66174, km: 6.677 },
+            { lat: 35.85267, lng: 139.66322, km: 6.857 },
+            { lat: 35.8518, lng: 139.66454, km: 7.01 },
+            { lat: 35.85101, lng: 139.66555, km: 7.137 },
+            { lat: 35.84974, lng: 139.66701, km: 7.33 },
+            { lat: 35.84745, lng: 139.66963, km: 7.677 },
+            { lat: 35.84647, lng: 139.67064, km: 7.819 },
+            { lat: 35.84508, lng: 139.67228, km: 8.033 },
+            { lat: 35.84424, lng: 139.67326, km: 8.162 },
+            { lat: 35.84262, lng: 139.67518, km: 8.412 },
+            { lat: 35.84149, lng: 139.67641, km: 8.579 },
+            { lat: 35.84067, lng: 139.67728, km: 8.699 },
+            { lat: 35.83985, lng: 139.67815, km: 8.82 },
+            { lat: 35.83905, lng: 139.67899, km: 8.937 },
+            { lat: 35.83803, lng: 139.68004, km: 9.084 },
+            { lat: 35.83655, lng: 139.68166, km: 9.304 },
+            { lat: 35.8349, lng: 139.68335, km: 9.543 },
+            { lat: 35.83334, lng: 139.68489, km: 9.765 },
+            { lat: 35.83199, lng: 139.68621, km: 9.957 },
+            { lat: 35.83059, lng: 139.68769, km: 10.162 },
+            { lat: 35.82901, lng: 139.6893, km: 10.39 },
+            { lat: 35.82721, lng: 139.69116, km: 10.651 },
+            { lat: 35.82577, lng: 139.69254, km: 10.854 },
+            { lat: 35.82481, lng: 139.69356, km: 10.994 },
+            { lat: 35.82385, lng: 139.69481, km: 11.15 },
+            { lat: 35.8226, lng: 139.69653, km: 11.358 },
+            { lat: 35.8214, lng: 139.6982, km: 11.559 },
+            { lat: 35.82071, lng: 139.69911, km: 11.671 },
+            { lat: 35.81936, lng: 139.7005, km: 11.867 },
+            { lat: 35.81847, lng: 139.7014, km: 11.995 },
+            { lat: 35.81759, lng: 139.70227, km: 12.12 },
+            { lat: 35.81613, lng: 139.70375, km: 12.331 },
+            { lat: 35.8149, lng: 139.70497, km: 12.506 },
+            { lat: 35.81297, lng: 139.70685, km: 12.78 },
+            { lat: 35.81208, lng: 139.70769, km: 12.904 },
+            { lat: 35.81127, lng: 139.70849, km: 13.02 },
+            { lat: 35.81042, lng: 139.70934, km: 13.141 },
+            { lat: 35.8096, lng: 139.71016, km: 13.259 },
+            { lat: 35.80799, lng: 139.71178, km: 13.49 },
+            { lat: 35.80612, lng: 139.71366, km: 13.758 },
+            { lat: 35.80519, lng: 139.71464, km: 13.894 },
+            { lat: 35.80393, lng: 139.71588, km: 14.073 },
+            { lat: 35.80267, lng: 139.71698, km: 14.245 },
+            { lat: 35.80169, lng: 139.71758, km: 14.367 },
+            { lat: 35.80041, lng: 139.7181, km: 14.517 },
+            { lat: 35.799, lng: 139.71832, km: 14.675 },
+            { lat: 35.79654, lng: 139.71805, km: 14.95 },
+            { lat: 35.7951, lng: 139.71794, km: 15.111 },
+            { lat: 35.79191, lng: 139.71758, km: 15.467 },
+            { lat: 35.78851, lng: 139.71721, km: 15.847 },
+            { lat: 35.78734, lng: 139.71709, km: 15.977 },
+            { lat: 35.78622, lng: 139.71699, km: 16.102 },
+            { lat: 35.78499, lng: 139.71723, km: 16.241 },
+            { lat: 35.784, lng: 139.71763, km: 16.357 },
+            { lat: 35.78277, lng: 139.71817, km: 16.502 },
+            { lat: 35.78175, lng: 139.7187, km: 16.625 },
+            { lat: 35.78075, lng: 139.71919, km: 16.745 },
+            { lat: 35.77977, lng: 139.71978, km: 16.866 },
+            { lat: 35.77867, lng: 139.72046, km: 17.003 },
+            { lat: 35.77783, lng: 139.72111, km: 17.113 },
+            { lat: 35.77, lng: 139.72035, km: 17.986 },
+            { lat: 35.76012, lng: 139.71945, km: 19.088 },
+            { lat: 35.753, lng: 139.7191, km: 19.88 },
+            { lat: 35.74573, lng: 139.71886, km: 20.689 },
+            { lat: 35.7395, lng: 139.7176, km: 21.391 },
+            { lat: 35.7348, lng: 139.7143, km: 21.993 },
+            { lat: 35.7313, lng: 139.7125, km: 22.414 },
+            { lat: 35.72893, lng: 139.71038, km: 22.74 },
+            { lat: 35.72618, lng: 139.70915, km: 23.065 },
+            { lat: 35.72406, lng: 139.70802, km: 23.322 },
+            { lat: 35.72181, lng: 139.7068, km: 23.596 },
+            { lat: 35.71933, lng: 139.70596, km: 23.882 },
+            { lat: 35.71621, lng: 139.70495, km: 24.241 },
+            { lat: 35.71521, lng: 139.70461, km: 24.356 },
+            { lat: 35.7141, lng: 139.70423, km: 24.484 },
+            { lat: 35.71171, lng: 139.70342, km: 24.76 },
+            { lat: 35.71048, lng: 139.70298, km: 24.902 },
+            { lat: 35.70933, lng: 139.70258, km: 25.035 },
+            { lat: 35.70486, lng: 139.70099, km: 25.553 },
+            { lat: 35.70389, lng: 139.70065, km: 25.665 },
+            { lat: 35.70221, lng: 139.70038, km: 25.853 },
+            { lat: 35.70011, lng: 139.70019, km: 26.087 },
+            { lat: 35.6989, lng: 139.70006, km: 26.222 },
+            { lat: 35.69775, lng: 139.69986, km: 26.352 },
+            { lat: 35.69644, lng: 139.69952, km: 26.501 },
+            { lat: 35.69531, lng: 139.6994, km: 26.627 },
+            { lat: 35.69392, lng: 139.69967, km: 26.783 },
+            { lat: 35.69286, lng: 139.69994, km: 26.904 },
+            { lat: 35.69167, lng: 139.70004, km: 27.037 },
+            { lat: 35.68995, lng: 139.7006, km: 27.235 },
+            { lat: 35.68894, lng: 139.70091, km: 27.35 },
+            { lat: 35.6879, lng: 139.70125, km: 27.47 },
+            { lat: 35.68665, lng: 139.70171, km: 27.615 },
+            { lat: 35.68555, lng: 139.70222, km: 27.746 },
+            { lat: 35.68355, lng: 139.70272, km: 27.973 },
+            { lat: 35.68239, lng: 139.70302, km: 28.105 },
+            { lat: 35.68058, lng: 139.70348, km: 28.31 },
+            { lat: 35.67936, lng: 139.70377, km: 28.448 },
+            { lat: 35.67771, lng: 139.70398, km: 28.633 },
+            { lat: 35.67667, lng: 139.70413, km: 28.75 },
+            { lat: 35.67552, lng: 139.70412, km: 28.877 },
+            { lat: 35.67338, lng: 139.70345, km: 29.123 },
+            { lat: 35.6722, lng: 139.70295, km: 29.262 },
+            { lat: 35.6711, lng: 139.70264, km: 29.388 },
+            { lat: 35.6699, lng: 139.70243, km: 29.522 },
+            { lat: 35.66891, lng: 139.70232, km: 29.633 },
+            { lat: 35.66678, lng: 139.70205, km: 29.871 },
+            { lat: 35.66349, lng: 139.70164, km: 30.239 },
+            { lat: 35.66213, lng: 139.70147, km: 30.391 },
+            { lat: 35.66023, lng: 139.70123, km: 30.603 },
+            { lat: 35.65907, lng: 139.70129, km: 30.733 },
+            { lat: 35.65785, lng: 139.70174, km: 30.875 },
+            { lat: 35.65595, lng: 139.70334, km: 31.131 },
+            { lat: 35.6549, lng: 139.70427, km: 31.275 },
+            { lat: 35.65366, lng: 139.70538, km: 31.446 },
+            { lat: 35.65241, lng: 139.70643, km: 31.614 },
+            { lat: 35.65134, lng: 139.70742, km: 31.763 },
+            { lat: 35.64947, lng: 139.70856, km: 31.996 },
+            { lat: 35.64804, lng: 139.70937, km: 32.171 },
+            { lat: 35.64593, lng: 139.71054, km: 32.428 },
+            { lat: 35.6449, lng: 139.7111, km: 32.553 },
+            { lat: 35.64361, lng: 139.7118, km: 32.71 },
+            { lat: 35.64224, lng: 139.71261, km: 32.879 },
+            { lat: 35.64093, lng: 139.71334, km: 33.039 },
+            { lat: 35.63967, lng: 139.71404, km: 33.193 },
+            { lat: 35.63865, lng: 139.71438, km: 33.311 },
+            { lat: 35.63702, lng: 139.71479, km: 33.496 },
+            { lat: 35.63513, lng: 139.71529, km: 33.711 },
+            { lat: 35.63395, lng: 139.71557, km: 33.845 },
+            { lat: 35.63284, lng: 139.71585, km: 33.971 },
+            { lat: 35.63136, lng: 139.71636, km: 34.141 },
+            { lat: 35.63027, lng: 139.71713, km: 34.282 },
+            { lat: 35.62944, lng: 139.71829, km: 34.422 },
+            { lat: 35.62888, lng: 139.71957, km: 34.553 },
+            { lat: 35.62806, lng: 139.7214, km: 34.742 },
+            { lat: 35.62727, lng: 139.72262, km: 34.883 },
+            { lat: 35.62562, lng: 139.72407, km: 35.11 },
+            { lat: 35.62446, lng: 139.72496, km: 35.262 },
+            { lat: 35.62262, lng: 139.72628, km: 35.498 },
+            { lat: 35.62077, lng: 139.72761, km: 35.737 },
+            { lat: 35.61912, lng: 139.72888, km: 35.953 },
+            { lat: 35.61816, lng: 139.72964, km: 36.08 },
+            { lat: 35.61732, lng: 139.73068, km: 36.214 },
+            { lat: 35.61682, lng: 139.73227, km: 36.369 },
+            { lat: 35.61612, lng: 139.73106, km: 36.59 },
+            { lat: 35.61555, lng: 139.73005, km: 36.702 },
+            { lat: 35.61453, lng: 139.7291, km: 36.845 },
+            { lat: 35.61273, lng: 139.728, km: 37.068 },
+            { lat: 35.61002, lng: 139.72636, km: 37.404 },
+            { lat: 35.60896, lng: 139.7255, km: 37.545 },
+            { lat: 35.60774, lng: 139.72452, km: 37.707 },
+            { lat: 35.60622, lng: 139.7236, km: 37.896 },
+            { lat: 35.60472, lng: 139.72292, km: 38.074 },
+            { lat: 35.60255, lng: 139.72197, km: 38.33 },
+            { lat: 35.60132, lng: 139.72144, km: 38.475 },
+            { lat: 35.59754, lng: 139.71978, km: 38.921 },
+            { lat: 35.59611, lng: 139.71861, km: 39.113 },
+            { lat: 35.59486, lng: 139.7169, km: 39.322 },
+            { lat: 35.59422, lng: 139.71516, km: 39.495 },
+            { lat: 35.59321, lng: 139.7116, km: 39.836 },
+            { lat: 35.59237, lng: 139.70858, km: 40.124 },
+            { lat: 35.5919, lng: 139.70746, km: 40.239 },
+            { lat: 35.59156, lng: 139.70624, km: 40.356 },
+            { lat: 35.59124, lng: 139.70508, km: 40.467 },
+            { lat: 35.59087, lng: 139.70372, km: 40.597 },
+            { lat: 35.59052, lng: 139.70245, km: 40.718 },
+            { lat: 35.59013, lng: 139.70106, km: 40.851 },
+            { lat: 35.58978, lng: 139.69978, km: 40.973 },
+            { lat: 35.58934, lng: 139.69821, km: 41.123 },
+            { lat: 35.58891, lng: 139.69665, km: 41.272 },
+            { lat: 35.58802, lng: 139.6935, km: 41.574 },
+            { lat: 35.58751, lng: 139.69188, km: 41.731 },
+            { lat: 35.58708, lng: 139.69042, km: 41.871 },
+            { lat: 35.58668, lng: 139.68916, km: 41.994 },
+            { lat: 35.58601, lng: 139.68682, km: 42.218 },
+            { lat: 35.58497, lng: 139.68322, km: 42.563 },
+            { lat: 35.58417, lng: 139.68039, km: 42.834 },
+            { lat: 35.58334, lng: 139.67752, km: 43.11 },
+            { lat: 35.58268, lng: 139.67561, km: 43.297 },
+            { lat: 35.58096, lng: 139.67064, km: 43.786 },
+            { lat: 35.58017, lng: 139.66847, km: 44.001 },
+            { lat: 35.57975, lng: 139.66734, km: 44.113 },
+            { lat: 35.57923, lng: 139.66605, km: 44.244 },
+            { lat: 35.57851, lng: 139.66481, km: 44.382 },
+            { lat: 35.57753, lng: 139.66393, km: 44.517 },
+            { lat: 35.57633, lng: 139.66339, km: 44.66 },
+            { lat: 35.57527, lng: 139.66327, km: 44.778 },
+            { lat: 35.57406, lng: 139.66352, km: 44.915 },
+            { lat: 35.57303, lng: 139.66388, km: 45.034 },
+            { lat: 35.56918, lng: 139.66513, km: 45.477 },
+            { lat: 35.56759, lng: 139.66563, km: 45.66 },
+            { lat: 35.56557, lng: 139.66632, km: 45.893 },
+            { lat: 35.56373, lng: 139.66695, km: 46.105 },
+            { lat: 35.5619, lng: 139.66756, km: 46.316 },
+            { lat: 35.56029, lng: 139.66816, km: 46.503 },
+            { lat: 35.55925, lng: 139.66852, km: 46.623 },
+            { lat: 35.55828, lng: 139.66886, km: 46.735 },
+            { lat: 35.55667, lng: 139.66945, km: 46.922 },
+            { lat: 35.55505, lng: 139.67004, km: 47.11 },
+            { lat: 35.5539, lng: 139.67049, km: 47.244 },
+            { lat: 35.55184, lng: 139.6715, km: 47.491 },
+            { lat: 35.55035, lng: 139.67218, km: 47.668 },
+            { lat: 35.54805, lng: 139.67326, km: 47.941 },
+            { lat: 35.54698, lng: 139.67362, km: 48.064 },
+            { lat: 35.54455, lng: 139.67445, km: 48.345 },
+            { lat: 35.54145, lng: 139.67529, km: 48.698 },
+            { lat: 35.53811, lng: 139.67636, km: 49.082 },
+            { lat: 35.5365, lng: 139.67667, km: 49.264 },
+            { lat: 35.53448, lng: 139.67727, km: 49.495 },
+            { lat: 35.53091, lng: 139.6785, km: 49.906 },
+            { lat: 35.52803, lng: 139.67942, km: 50.237 },
+            { lat: 35.52607, lng: 139.67991, km: 50.46 },
+            { lat: 35.52436, lng: 139.68024, km: 50.652 },
+            { lat: 35.52271, lng: 139.68071, km: 50.841 },
+            { lat: 35.52152, lng: 139.68112, km: 50.978 },
+            { lat: 35.5204, lng: 139.68136, km: 51.105 },
+            { lat: 35.51925, lng: 139.68122, km: 51.234 },
+            { lat: 35.51821, lng: 139.68069, km: 51.36 },
+            { lat: 35.51728, lng: 139.67995, km: 51.483 },
+            { lat: 35.51635, lng: 139.67903, km: 51.616 },
+            { lat: 35.51545, lng: 139.67838, km: 51.732 },
+            { lat: 35.51309, lng: 139.67747, km: 52.008 },
+            { lat: 35.51197, lng: 139.6771, km: 52.137 },
+            { lat: 35.50958, lng: 139.67649, km: 52.408 },
+            { lat: 35.50779, lng: 139.67609, km: 52.61 },
+            { lat: 35.50637, lng: 139.67578, km: 52.771 },
+            { lat: 35.5049, lng: 139.6754, km: 52.938 },
+            { lat: 35.50387, lng: 139.67512, km: 53.055 },
+            { lat: 35.50265, lng: 139.67449, km: 53.203 },
+            { lat: 35.5014, lng: 139.67347, km: 53.37 },
+            { lat: 35.50041, lng: 139.6724, km: 53.517 },
+            { lat: 35.49674, lng: 139.66801, km: 54.087 },
+            { lat: 35.49485, lng: 139.66573, km: 54.381 },
+            { lat: 35.4939, lng: 139.66463, km: 54.526 },
+            { lat: 35.49282, lng: 139.66355, km: 54.684 },
+            { lat: 35.49181, lng: 139.66257, km: 54.827 },
+            { lat: 35.49077, lng: 139.66112, km: 55.002 },
+            { lat: 35.48994, lng: 139.65986, km: 55.149 },
+            { lat: 35.48924, lng: 139.65856, km: 55.29 },
+            { lat: 35.48835, lng: 139.65687, km: 55.473 },
+            { lat: 35.48771, lng: 139.65574, km: 55.597 },
+            { lat: 35.48695, lng: 139.6544, km: 55.745 },
+            { lat: 35.48643, lng: 139.6533, km: 55.86 },
+            { lat: 35.48589, lng: 139.65188, km: 56.003 },
+            { lat: 35.48558, lng: 139.65049, km: 56.133 },
+            { lat: 35.4855, lng: 139.64927, km: 56.244 },
+            { lat: 35.48544, lng: 139.64798, km: 56.361 },
+            { lat: 35.48515, lng: 139.64568, km: 56.572 },
+            { lat: 35.48479, lng: 139.64416, km: 56.715 },
+            { lat: 35.48424, lng: 139.64234, km: 56.891 },
+            { lat: 35.48362, lng: 139.64035, km: 57.084 },
+            { lat: 35.48317, lng: 139.6389, km: 57.225 },
+            { lat: 35.48229, lng: 139.63715, km: 57.411 },
+            { lat: 35.48124, lng: 139.63602, km: 57.566 },
+            { lat: 35.47947, lng: 139.63436, km: 57.814 },
+            { lat: 35.47716, lng: 139.63223, km: 58.135 },
+            { lat: 35.47525, lng: 139.63046, km: 58.401 },
+            { lat: 35.47388, lng: 139.6292, km: 58.592 },
+            { lat: 35.47305, lng: 139.62845, km: 58.706 },
+            { lat: 35.47223, lng: 139.62775, km: 58.817 },
+            { lat: 35.47108, lng: 139.62678, km: 58.973 },
+            { lat: 35.46976, lng: 139.62567, km: 59.15 },
+            { lat: 35.46769, lng: 139.62387, km: 59.433 },
+            { lat: 35.46533, lng: 139.62179, km: 59.756 },
+            { lat: 35.46421, lng: 139.62073, km: 59.913 },
+            { lat: 35.46325, lng: 139.61986, km: 60.046 },
+            { lat: 35.46164, lng: 139.61841, km: 60.268 },
+            { lat: 35.46068, lng: 139.61752, km: 60.402 },
+            { lat: 35.45893, lng: 139.6159, km: 60.646 },
+            { lat: 35.45771, lng: 139.61479, km: 60.814 },
+            { lat: 35.45657, lng: 139.61374, km: 60.973 },
+            { lat: 35.45515, lng: 139.61213, km: 61.188 },
+            { lat: 35.45444, lng: 139.61092, km: 61.323 },
+            { lat: 35.45374, lng: 139.6096, km: 61.466 },
+            { lat: 35.45264, lng: 139.60766, km: 61.68 },
+            { lat: 35.45124, lng: 139.60516, km: 61.955 },
+            { lat: 35.45, lng: 139.6033, km: 62.173 },
+            { lat: 35.44846, lng: 139.60167, km: 62.399 },
+            { lat: 35.44598, lng: 139.59907, km: 62.762 },
+            { lat: 35.44531, lng: 139.59787, km: 62.894 },
+            { lat: 35.44483, lng: 139.59605, km: 63.068 },
+            { lat: 35.44516, lng: 139.59281, km: 63.365 },
+            { lat: 35.44536, lng: 139.59115, km: 63.517 },
+            { lat: 35.44576, lng: 139.58853, km: 63.758 },
+            { lat: 35.44648, lng: 139.58346, km: 64.224 },
+            { lat: 35.44699, lng: 139.57961, km: 64.578 },
+            { lat: 35.44673, lng: 139.57746, km: 64.776 },
+            { lat: 35.44582, lng: 139.57557, km: 64.975 },
+            { lat: 35.44528, lng: 139.57451, km: 65.088 },
+            { lat: 35.44295, lng: 139.56987, km: 65.582 },
+            { lat: 35.44101, lng: 139.56587, km: 66.004 },
+            { lat: 35.43921, lng: 139.56242, km: 66.375 },
+            { lat: 35.4382, lng: 139.56128, km: 66.528 },
+            { lat: 35.43693, lng: 139.56012, km: 66.704 },
+            { lat: 35.43477, lng: 139.55821, km: 67.0 },
+            { lat: 35.4335, lng: 139.55741, km: 67.159 },
+            { lat: 35.43158, lng: 139.5569, km: 67.378 },
+            { lat: 35.43049, lng: 139.55689, km: 67.499 },
+            { lat: 35.42942, lng: 139.55689, km: 67.618 },
+            { lat: 35.4284, lng: 139.55684, km: 67.732 },
+            { lat: 35.42668, lng: 139.55621, km: 67.932 },
+            { lat: 35.42482, lng: 139.55531, km: 68.154 },
+            { lat: 35.42384, lng: 139.55485, km: 68.271 },
+            { lat: 35.42283, lng: 139.55407, km: 68.404 },
+            { lat: 35.42193, lng: 139.55309, km: 68.538 },
+            { lat: 35.42123, lng: 139.55199, km: 68.664 },
+            { lat: 35.42055, lng: 139.5508, km: 68.796 },
+            { lat: 35.41994, lng: 139.54953, km: 68.929 },
+            { lat: 35.41875, lng: 139.54736, km: 69.167 },
+            { lat: 35.41662, lng: 139.54331, km: 69.603 },
+            { lat: 35.415, lng: 139.54026, km: 69.933 },
+            { lat: 35.41366, lng: 139.53807, km: 70.182 },
+            { lat: 35.41284, lng: 139.53684, km: 70.326 },
+            { lat: 35.41168, lng: 139.53568, km: 70.493 },
+            { lat: 35.41059, lng: 139.53506, km: 70.627 },
+            { lat: 35.40956, lng: 139.53459, km: 70.749 },
+            { lat: 35.40812, lng: 139.53433, km: 70.911 },
+            { lat: 35.40639, lng: 139.5341, km: 71.104 },
+            { lat: 35.40452, lng: 139.53383, km: 71.314 },
+            { lat: 35.40344, lng: 139.53372, km: 71.434 },
+            { lat: 35.4017, lng: 139.53392, km: 71.629 },
+            { lat: 35.40034, lng: 139.53433, km: 71.785 },
+            { lat: 35.39926, lng: 139.53468, km: 71.909 },
+            { lat: 35.39793, lng: 139.53511, km: 72.062 },
+            { lat: 35.39659, lng: 139.53552, km: 72.215 },
+            { lat: 35.39519, lng: 139.53572, km: 72.372 },
+            { lat: 35.39349, lng: 139.53564, km: 72.562 },
+            { lat: 35.39179, lng: 139.53548, km: 72.751 },
+            { lat: 35.38921, lng: 139.53524, km: 73.039 },
+            { lat: 35.38661, lng: 139.535, km: 73.329 },
+            { lat: 35.38394, lng: 139.53476, km: 73.627 },
+            { lat: 35.3828, lng: 139.53463, km: 73.754 },
+            { lat: 35.38134, lng: 139.53444, km: 73.917 },
+            { lat: 35.38026, lng: 139.5342, km: 74.039 },
+            { lat: 35.37875, lng: 139.53362, km: 74.215 },
+            { lat: 35.37736, lng: 139.53296, km: 74.381 },
+            { lat: 35.3758, lng: 139.5321, km: 74.571 },
+            { lat: 35.37438, lng: 139.5313, km: 74.745 },
+            { lat: 35.37313, lng: 139.5306, km: 74.898 },
+            { lat: 35.37173, lng: 139.52997, km: 75.064 },
+            { lat: 35.37072, lng: 139.52956, km: 75.182 },
+            { lat: 35.36915, lng: 139.52971, km: 75.358 },
+            { lat: 35.3679, lng: 139.53001, km: 75.5 },
+            { lat: 35.3665, lng: 139.5304, km: 75.659 },
+            { lat: 35.36545, lng: 139.53039, km: 75.777 },
+            { lat: 35.36445, lng: 139.53007, km: 75.892 },
+            { lat: 35.36325, lng: 139.52959, km: 76.032 },
+            { lat: 35.362, lng: 139.52923, km: 76.175 },
+            { lat: 35.36091, lng: 139.52922, km: 76.297 },
+            { lat: 35.35979, lng: 139.52965, km: 76.428 },
+            { lat: 35.35829, lng: 139.53077, km: 76.623 },
+            { lat: 35.3571, lng: 139.53156, km: 76.774 },
+            { lat: 35.35591, lng: 139.53173, km: 76.908 },
+            { lat: 35.35412, lng: 139.53115, km: 77.115 },
+            { lat: 35.35303, lng: 139.53113, km: 77.243 },
+            { lat: 35.35101, lng: 139.53043, km: 77.477 },
+            { lat: 35.34979, lng: 139.53016, km: 77.615 },
+            { lat: 35.34853, lng: 139.53069, km: 77.764 },
+            { lat: 35.34758, lng: 139.53144, km: 77.89 },
+            { lat: 35.34651, lng: 139.53245, km: 78.04 },
+            { lat: 35.34515, lng: 139.53371, km: 78.23 },
+            { lat: 35.34425, lng: 139.53461, km: 78.359 },
+            { lat: 35.34339, lng: 139.53579, km: 78.504 },
+            { lat: 35.34272, lng: 139.53782, km: 78.703 },
+            { lat: 35.34221, lng: 139.53927, km: 78.846 },
+            { lat: 35.34167, lng: 139.54038, km: 78.963 },
+            { lat: 35.34056, lng: 139.54174, km: 79.138 },
+            { lat: 35.33867, lng: 139.54377, km: 79.418 },
+            { lat: 35.33721, lng: 139.54536, km: 79.635 },
+            { lat: 35.33646, lng: 139.54618, km: 79.746 },
+            { lat: 35.33546, lng: 139.54728, km: 79.896 },
+            { lat: 35.33456, lng: 139.54809, km: 80.02 },
+            { lat: 35.3336, lng: 139.5485, km: 80.134 },
+            { lat: 35.33249, lng: 139.54861, km: 80.258 },
+            { lat: 35.33149, lng: 139.54858, km: 80.369 },
+            { lat: 35.3305, lng: 139.54856, km: 80.479 },
+            { lat: 35.32938, lng: 139.54852, km: 80.604 },
+            { lat: 35.32808, lng: 139.5485, km: 80.748 },
+            { lat: 35.3271, lng: 139.54881, km: 80.862 },
+            { lat: 35.32611, lng: 139.54948, km: 80.988 },
+            { lat: 35.32521, lng: 139.55022, km: 81.109 },
+            { lat: 35.32429, lng: 139.55069, km: 81.22 },
+            { lat: 35.32288, lng: 139.55078, km: 81.377 },
+            { lat: 35.3213, lng: 139.55065, km: 81.553 },
+            { lat: 35.31996, lng: 139.55046, km: 81.703 },
+            { lat: 35.31887, lng: 139.5504, km: 81.825 },
+            { lat: 35.31752, lng: 139.55047, km: 81.975 },
+            { lat: 35.3165, lng: 139.55073, km: 82.091 },
+            { lat: 35.31554, lng: 139.55107, km: 82.202 },
+            { lat: 35.31447, lng: 139.55164, km: 82.332 },
+            { lat: 35.31344, lng: 139.55238, km: 82.465 },
+            { lat: 35.31257, lng: 139.55332, km: 82.594 },
+            { lat: 35.3119, lng: 139.55425, km: 82.707 },
+            { lat: 35.31129, lng: 139.55526, km: 82.821 },
+            { lat: 35.31073, lng: 139.55663, km: 82.96 },
+            { lat: 35.31036, lng: 139.55799, km: 83.09 },
+            { lat: 35.3101, lng: 139.55928, km: 83.211 },
+            { lat: 35.3098, lng: 139.56064, km: 83.339 },
+            { lat: 35.30927, lng: 139.56179, km: 83.459 },
+            { lat: 35.30859, lng: 139.56309, km: 83.599 },
+            { lat: 35.30767, lng: 139.56484, km: 83.788 },
+            { lat: 35.30711, lng: 139.56593, km: 83.905 },
+            { lat: 35.30654, lng: 139.56719, km: 84.036 },
+            { lat: 35.3059, lng: 139.56831, km: 84.161 },
+            { lat: 35.30492, lng: 139.56929, km: 84.302 },
+            { lat: 35.30394, lng: 139.56976, km: 84.42 },
+            { lat: 35.30248, lng: 139.57034, km: 84.59 },
+            { lat: 35.30123, lng: 139.57082, km: 84.736 },
+            { lat: 35.30029, lng: 139.57133, km: 84.85 },
+            { lat: 35.29942, lng: 139.57195, km: 84.962 },
+            { lat: 35.29869, lng: 139.57286, km: 85.078 },
+            { lat: 35.29803, lng: 139.57382, km: 85.192 },
+            { lat: 35.29753, lng: 139.57515, km: 85.326 },
+            { lat: 35.2973, lng: 139.57661, km: 85.461 },
+            { lat: 35.29735, lng: 139.57813, km: 85.599 },
+            { lat: 35.29747, lng: 139.57894, km: 85.674 }
+        ];
+
+        // 💡 沿線スポット定義（カテゴリ→アイコン/色、スポット本体）。ここに行を足すだけで地図ピン・カード・ハイライトに反映
+        var CATEGORIES = {
+            "建造物": { icon: "fa-bridge-water", color: "#818cf8" },
+            "景観":   { icon: "fa-camera",       color: "#60a5fa" },
+            "歴史":   { icon: "fa-landmark",     color: "#f59e0b" },
+            "自然":   { icon: "fa-leaf",         color: "#34d399" },
+            "駅":     { icon: "fa-train",        color: "#fb7185" },
+            "その他": { icon: "fa-lightbulb",    color: "#facc15" }
+        };
+
+        var SPOTS = [
+            { name: "鉄道博物館（てっぱく）", cat: "歴史", kmStart: 0.4, kmEnd: 0.4, lat: 35.89818, lng: 139.61957, short: "「てっぱく」の愛称で親しまれる日本最大級の鉄道博物館。実物車両がずらりと並び、運転シミュレータも人気。", detail: "大宮はかつて鉄道工場と操車場で栄えた「鉄道の街」。湘南新宿ラインの北の起点にふさわしいロケーション。", show: true },
+            { name: "荒川橋梁", cat: "建造物", kmStart: 13.8, kmEnd: 13.8, lat: 35.80612, lng: 139.71366, short: "東京都と埼玉県の境を流れる荒川を渡る長大橋梁。赤羽の手前で一気に視界が開ける。", detail: "", show: true },
+            { name: "山手貨物線（並走区間）", cat: "その他", kmStart: 22.7, kmEnd: 35.9, lat: 35.6896, lng: 139.7, short: "湘南新宿ラインが走るのは山手線の外側を回る「山手貨物線」。池袋〜大崎では山手線・埼京線と並走する。", detail: "旅客化される前は貨物専用だった線路。すぐ隣を山手線の電車が走る光景が見られる区間。", show: true },
+            { name: "蛇窪信号場", cat: "その他", kmStart: 37.7, kmEnd: 37.7, lat: 35.60774, lng: 139.72452, short: "大崎〜西大井間にある名高い平面交差。増発のネックとされ、立体化（蛇窪立体）が計画されている。", detail: "相鉄・JR直通線もここを通るためダイヤ過密の要因に。鉄道ファンにはおなじみの難所。", show: true },
+            { name: "多摩川橋梁", cat: "建造物", kmStart: 44.2, kmEnd: 44.2, lat: 35.57923, lng: 139.66605, short: "品鶴線が多摩川を渡り、東京都から神奈川県へ。正面に武蔵小杉の高層ビル群がそびえる。", detail: "", show: true },
+            { name: "新鶴見信号場", cat: "その他", kmStart: 48.7, kmEnd: 48.7, lat: 35.54145, lng: 139.67529, short: "かつて「東洋一」と称された新鶴見操車場の後身。今も数多くの貨物列車が行き交う一大拠点。", detail: "新川崎駅はこの操車場跡地に開設された。武蔵野線方面への短絡線もここから分岐する。", show: true },
+            { name: "鶴見川橋梁", cat: "建造物", kmStart: 52.8, kmEnd: 52.8, lat: 35.50637, lng: 139.67578, short: "品鶴線が鶴見川を渡り、まもなく東海道本線（横須賀線）と合流。横浜の市街地へ入っていく。", detail: "", show: true },
+            { name: "大船観音", cat: "歴史", kmStart: 77.4, kmEnd: 77.4, lat: 35.3533, lng: 139.5268, short: "丘の上から街を見守る白亜の巨大観音像。大船駅の車窓ランドマークとして親しまれている。", detail: "", show: true },
+            { name: "円覚寺", cat: "その他", kmStart: 78.8, kmEnd: 80.2, lat: 35.337800, lng: 139.547300, short: "北鎌倉駅のホームのすぐ目の前に総門が建つ臨済宗の大本山。線路と境内が隣接し、車窓からも伽藍がのぞく。", detail: "鎌倉五山第二位。鎌倉時代に元寇の戦没者を弔うため北条時宗が創建した。国宝の舎利殿や洪鐘で知られる。", show: true },
+            { name: "鶴岡八幡宮", cat: "その他", kmStart: 80.8, kmEnd: 82.4, lat: 35.325780, lng: 139.556320, short: "鎌倉駅から若宮大路をまっすぐ北へ。源頼朝が整備した、武家の都・鎌倉の象徴的な存在。", detail: "境内の段葛（だんかずら）と呼ばれる参道や、舞殿、本宮へ続く大石段が有名。初詣には多くの参拝客が訪れる。", show: true },
+            { name: "逗子海岸", cat: "その他", kmStart: 84.3, kmEnd: 85.7, lat: 35.292000, lng: 139.583000, short: "逗子駅から徒歩圏に広がる、相模湾に面した遠浅の海岸。夏は海水浴客でにぎわう。", detail: "穏やかな波と富士山・江の島を望む眺望で知られ、ヨットやマリンスポーツの拠点・逗子マリーナも近い。", show: true }
+        ];
+
+        var SPOT_IDS = []; // renderSpotCards() が採番
+
+        // 💡 グローバル変数
+        var map;
+        var trainMarker;
+        var spotMarkers = [];
+        var currentMode = "demo";
+        var currentKm = 0.0;
+        var demoPlayInterval = null;
+        var isDemoPlaying = false;
+        var watchId = null;
+        var isMapUserInteracting = false; // ユーザーが地図を手動操作しているフラグ
+
+        // トースト通知システム
+        function showToast(message, type = "info") {
+            var toast = document.getElementById("app-toast");
+            var icon = document.getElementById("toast-icon");
+            var msgSpan = document.getElementById("toast-message");
+
+            msgSpan.innerText = message;
+            
+            if (type === "error") {
+                icon.className = "fa-solid fa-triangle-exclamation text-red-500";
+                toast.className = "fixed bottom-4 left-1/2 -translate-x-1/2 bg-red-950/95 border border-red-800 text-white text-xs px-4 py-2.5 rounded-xl shadow-2xl z-[9999] opacity-100 transform translate-y-0 transition-all duration-300 flex items-center gap-2";
+            } else {
+                icon.className = "fa-solid fa-circle-info text-blue-400";
+                toast.className = "fixed bottom-4 left-1/2 -translate-x-1/2 bg-slate-900/95 border border-slate-700 text-white text-xs px-4 py-2.5 rounded-xl shadow-2xl z-[9999] opacity-100 transform translate-y-0 transition-all duration-300 flex items-center gap-2";
+            }
+
+            setTimeout(function() {
+                toast.className = "fixed bottom-4 left-1/2 -translate-x-1/2 bg-slate-900/95 border border-slate-700 text-white text-xs px-4 py-2.5 rounded-xl shadow-2xl z-[9999] opacity-0 pointer-events-none transform translate-y-2 transition-all duration-300 flex items-center gap-2";
+            }, 3000);
+        }
+
+        // タイムライン構築 (無駄な要素を全廃、ズレを補正)
+        // 💡 スポットの km 表示（点なら単一、範囲なら a–b）
+        function spotKmLabel(s) {
+            if (Math.abs(s.kmEnd - s.kmStart) < 0.05) return s.kmStart.toFixed(1) + "km";
+            return s.kmStart.toFixed(1) + "–" + s.kmEnd.toFixed(1) + "km";
+        }
+
+        // 💡 SPOTS 配列からカードを自動生成（簡易表示は2行クランプ＋「詳細を見る」で全文）
+        function renderSpotCards() {
+            var container = document.getElementById("scenic-card-container");
+            if (!container) return;
+            SPOT_IDS = [];
+            var html = "";
+            SPOTS.forEach(function(s, i) {
+                if (s.show === false) return;
+                var id = "spot-" + i;
+                SPOT_IDS.push(id);
+                var cat = CATEGORIES[s.cat] || { icon: "fa-circle-info", color: "#94a3b8" };
+                var hasDetail = !!(s.detail && s.detail.trim().length > 0);
+                var needExpand = hasDetail || (s.short && s.short.length > 28);
+                var fullText = (s.short || "") + (hasDetail ? ("<br><br>" + s.detail) : "");
+                html += `
+                <div id="card-${id}" class="snap-center shrink-0 w-[210px] bg-appCard border border-appBorder rounded-xl p-2.5 flex flex-col justify-between transition-all duration-300 opacity-80 relative group shadow-md shadow-slate-950/40">
+                    <div class="flex flex-col h-full justify-between">
+                        <div>
+                            <div class="flex justify-between items-center gap-1">
+                                <span class="text-[9px] font-bold text-slate-200 bg-slate-800 px-1.5 py-0.5 rounded border border-slate-700 whitespace-nowrap">${spotKmLabel(s)}</span>
+                                <span class="text-[9px] font-bold flex items-center gap-1 whitespace-nowrap" style="color:${cat.color}">
+                                    <i class="fa-solid ${cat.icon}"></i> ${s.cat}
+                                </span>
+                            </div>
+                            <h4 class="text-xs font-black text-white mt-1.5 leading-snug">${s.name}</h4>
+                            <p class="text-[9px] text-slate-300 mt-0.5 leading-normal clamp-2" id="desc-${id}-short">${s.short || ""}</p>
+                            <p class="text-[9px] text-slate-300 mt-1 leading-normal hidden border-t border-slate-800 pt-1" id="desc-${id}-detail">${fullText}</p>
+                        </div>
+                        ${needExpand ? `
+                        <button onclick="toggleCardDetails('${id}')" class="mt-2 text-left text-[8px] font-bold flex items-center gap-1" style="color:${cat.color}">
+                            <i class="fa-solid fa-caret-down" id="icon-${id}"></i> <span id="label-${id}">詳細を見る</span>
+                        </button>` : ``}
+                    </div>
+                </div>`;
+            });
+            container.innerHTML = html;
+        }
+
+        // 💡 SPOTS 配列から地図ピンを自動生成（カテゴリ別アイコン・色）
+        function renderSpotMarkers() {
+            if (!map) return;
+            spotMarkers.forEach(function(m) { map.removeLayer(m); });
+            spotMarkers = [];
+            SPOTS.forEach(function(s) {
+                if (s.show === false) return;
+                var cat = CATEGORIES[s.cat] || { icon: "fa-circle-info", color: "#94a3b8" };
+                var icon = L.divIcon({
+                    html: `<div class="fix-rotate w-6 h-6 rounded-full flex items-center justify-center shadow-md" style="background:${cat.color}33;border:1px solid ${cat.color};color:${cat.color}"><i class="fa-solid ${cat.icon} text-[9px]"></i></div>`,
+                    className: '',
+                    iconSize: [24, 24],
+                    iconAnchor: [12, 12]
+                });
+                var m = L.marker([s.lat, s.lng], { icon: icon }).addTo(map);
+                m.bindTooltip(s.name, { direction: 'top', offset: [0, -8] });
+                spotMarkers.push(m);
+            });
+        }
+
+        function initTimeline() {
+            var container = document.getElementById("timeline-stations");
+            var html = "";
+            
+            stations.forEach(function(station, index) {
+                html += `
+                    <div id="station-${station.id}" class="station-row relative flex items-center justify-between h-4 opacity-35 transition-all duration-300">
+                        <!-- left-[12px] で縦線軸と絶対同調。現在地ドットとピッタリ重ねます -->
+                        <div class="absolute left-[12px] -translate-x-1/2 w-2 h-2 rounded-full bg-slate-700 z-10 border border-appDark"></div>
+                        <span class="station-name text-slate-300 font-bold text-xs pl-8">${station.name}</span>
+                        <span class="font-mono text-[9px] text-slate-500">${station.km.toFixed(1)}km</span>
+                    </div>
+                `;
+                
+                // 駅間ナビ矢印（進行中の脈動表示。left-[12px] にぴったり配置して左ずれを解消）
+                if (index < stations.length - 1) {
+                    var nextStation = stations[index + 1];
+                    html += `
+                        <div id="section-${station.id}-${nextStation.id}" class="section-row relative hidden items-center h-4 my-0.5 transition-all duration-300">
+                            <!-- 縦線軸（left-[12px]）と完璧に同調させてズレを排除 -->
+                            <div class="absolute left-[12px] -translate-x-1/2 w-4 h-4 flex items-center justify-center z-10 current-location-pulse">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="#2563eb" style="display:block;filter:drop-shadow(0 0 3px rgba(37,99,235,0.6))"><path d="M12 22 L4 5 L12 12 L20 5 Z"/></svg>
+                            </div>
+                        </div>
+                    `;
+                }
+            });
+            container.innerHTML = html;
+        }
+
+        // ハバーサイン距離算出
+        function getDistance(lat1, lon1, lat2, lon2) {
+            var R = 6371e3;
+            var dLat = (lat2 - lat1) * Math.PI / 180;
+            var dLon = (lon2 - lon1) * Math.PI / 180;
+            var a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                      Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                      Math.sin(dLon / 2) * Math.sin(dLon / 2);
+            return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        }
+
+        // ベクトル投影
+        function projectOnSegment(pLat, pLng, lat1, lng1, lat2, lng2) {
+            var x0 = pLng, y0 = pLat;
+            var x1 = lng1, y1 = lat1;
+            var x2 = lng2, y2 = lat2;
+            var dx = x2 - x1;
+            var dy = y2 - y1;
+            if (dx === 0 && dy === 0) return { lat: lat1, lng: lng1, t: 0 };
+            var t = ((x0 - x1) * dx + (y0 - y1) * dy) / (dx * dx + dy * dy);
+            t = Math.max(0, Math.min(1, t));
+            return { lat: y1 + t * dy, lng: x1 + t * dx, t: t };
+        }
+
+        // GPSマップマッチング
+        function mapMatchToTrack(lat, lng) {
+            var minDistance = Infinity;
+            var matchedPt = null;
+            var segmentIndex = 0;
+            var segmentOffset = 0;
+
+            for (var i = 0; i < trackPoints.length - 1; i++) {
+                var pt1 = trackPoints[i];
+                var pt2 = trackPoints[i + 1];
+                var proj = projectOnSegment(lat, lng, pt1.lat, pt1.lng, pt2.lat, pt2.lng);
+                var d = getDistance(lat, lng, proj.lat, proj.lng);
+                
+                if (d < minDistance) {
+                    minDistance = d;
+                    matchedPt = proj;
+                    segmentIndex = i;
+                    segmentOffset = proj.t;
+                }
+            }
+
+            var pt1 = trackPoints[segmentIndex];
+            var pt2 = trackPoints[segmentIndex + 1];
+            var interpolatedKm = pt1.km + (pt2.km - pt1.km) * segmentOffset;
+            
+            var dLng = (pt2.lng - pt1.lng) * Math.PI / 180;
+            var lat1Rad = pt1.lat * Math.PI / 180;
+            var lat2Rad = pt2.lat * Math.PI / 180;
+            var y = Math.sin(dLng) * Math.cos(lat2Rad);
+            var x = Math.cos(lat1Rad) * Math.sin(lat2Rad) - Math.sin(lat1Rad) * Math.cos(lat2Rad) * Math.cos(dLng);
+            var bearing = Math.atan2(y, x) * 180 / Math.PI;
+
+            return {
+                lat: matchedPt.lat,
+                lng: matchedPt.lng,
+                km: interpolatedKm,
+                bearing: (bearing + 360) % 360,
+                distance: minDistance
+            };
+        }
+
+        // デモ用キロ程補間
+        function getCoordsByKm(km) {
+            if (km <= 0) return { lat: trackPoints[0].lat, lng: trackPoints[0].lng, bearing: 180 };
+            var lastIdx = trackPoints.length - 1;
+            if (km >= trackPoints[lastIdx].km) return { lat: trackPoints[lastIdx].lat, lng: trackPoints[lastIdx].lng, bearing: 180 };
+
+            for (var i = 0; i < lastIdx; i++) {
+                var pt1 = trackPoints[i];
+                var pt2 = trackPoints[i + 1];
+                if (km >= pt1.km && km <= pt2.km) {
+                    var ratio = (km - pt1.km) / (pt2.km - pt1.km);
+                    var lat = pt1.lat + (pt2.lat - pt1.lat) * ratio;
+                    var lng = pt1.lng + (pt2.lng - pt1.lng) * ratio;
+
+                    var dLng = (pt2.lng - pt1.lng) * Math.PI / 180;
+                    var lat1Rad = pt1.lat * Math.PI / 180;
+                    var lat2Rad = pt2.lat * Math.PI / 180;
+                    var y = Math.sin(dLng) * Math.cos(lat2Rad);
+                    var x = Math.cos(lat1Rad) * Math.sin(lat2Rad) - Math.sin(lat1Rad) * Math.cos(lat2Rad) * Math.cos(dLng);
+                    var bearing = (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+
+                    return { lat: lat, lng: lng, bearing: bearing };
+                }
+            }
+            return { lat: trackPoints[0].lat, lng: trackPoints[0].lng, bearing: 180 };
+        }
+
+        // 💡 UI・位置・地図の同期
+        function updateAppStatus(km, coords, bearing, speed = null) {
+            currentKm = km;
+            
+            // 進捗バー同期
+            var progressPercent = (km / 85.7) * 100;
+            var uiMainProgress = document.getElementById("ui-main-progress");
+            var uiProgressDot = document.getElementById("ui-progress-dot");
+            var uiDistanceLabel = document.getElementById("ui-distance-label");
+            
+            if (uiMainProgress) uiMainProgress.style.width = `${progressPercent}%`;
+            if (uiProgressDot) uiProgressDot.style.left = `${progressPercent}%`;
+            if (uiDistanceLabel) uiDistanceLabel.innerText = `${km.toFixed(1)}km`;
+
+            var prevStation = stations[0];
+            var nextStation = stations[stations.length - 1];
+
+            for (var i = 0; i < stations.length - 1; i++) {
+                var st1 = stations[i];
+                var st2 = stations[i + 1];
+                if (km >= st1.km && km <= st2.km) {
+                    prevStation = st1;
+                    nextStation = st2;
+                    break;
+                }
+            }
+
+            // 💡駅停車中（駅前後0.15km未満）か駅間走行中か判定し、ヘッダー切り替え
+            var runningView = document.getElementById("header-running-view");
+            var stoppedView = document.getElementById("header-stopped-view");
+            var stoppedAtStation = null;
+
+            // 駅の判定
+            for (var j = 0; j < stations.length; j++) {
+                var st = stations[j];
+                if (Math.abs(km - st.km) < 0.15) {
+                    stoppedAtStation = st;
+                    break;
+                }
+            }
+
+            if (stoppedAtStation) {
+                // 「駅停車中」レイアウトに切り替え
+                if (runningView) runningView.classList.add("hidden");
+                if (stoppedView) {
+                    stoppedView.classList.remove("hidden");
+                    stoppedView.classList.add("flex");
+                }
+                
+                // 動的テキスト書き換え
+                var uiCurId = document.getElementById("ui-current-id");
+                var uiCurRubi = document.getElementById("ui-current-rubi");
+                var uiCurName = document.getElementById("ui-current-name");
+                var uiIntro = document.getElementById("ui-station-intro");
+                
+                if (uiCurId) uiCurId.innerText = stoppedAtStation.id;
+                if (uiCurRubi) uiCurRubi.innerText = stoppedAtStation.rubi;
+                if (uiCurName) uiCurName.innerText = stoppedAtStation.name;
+                if (uiIntro) uiIntro.innerText = stoppedAtStation.intro;
+
+                // タイムライン上の該当駅を停車表示に最大輝度化
+                var curRow = document.getElementById(`station-${stoppedAtStation.id}`);
+                if (curRow) {
+                    curRow.classList.remove("opacity-35", "opacity-60");
+                    curRow.classList.add("opacity-100");
+                    var curName = curRow.querySelector(".station-name");
+                    if (curName) curName.className = "station-name text-railRed font-black text-sm pl-8";
+                }
+            } else {
+                // 「駅間走行中」レイアウトに切り替え
+                if (stoppedView) stoppedView.classList.add("hidden");
+                if (runningView) {
+                    runningView.classList.remove("hidden");
+                    runningView.classList.add("flex");
+                }
+
+                // 通常の進行方向テキスト同期
+                var uiPrevRubi = document.getElementById("ui-prev-rubi");
+                var uiPrevName = document.getElementById("ui-prev-name");
+                var uiPrevId = document.getElementById("ui-prev-id");
+                var uiNextRubi = document.getElementById("ui-next-rubi");
+                var uiNextName = document.getElementById("ui-next-name");
+                var uiNextId = document.getElementById("ui-next-id");
+
+                if (uiPrevRubi) uiPrevRubi.innerText = prevStation.rubi;
+                if (uiPrevName) uiPrevName.innerText = prevStation.name;
+                if (uiPrevId) uiPrevId.innerText = prevStation.id;
+                if (uiNextRubi) uiNextRubi.innerText = nextStation.rubi;
+                if (uiNextName) uiNextName.innerText = nextStation.name;
+                if (uiNextId) uiNextId.innerText = nextStation.id;
+            }
+            
+            // 市町村名同期
+            var uiCity = document.getElementById("ui-city-name");
+            if (uiCity) uiCity.innerText = prevStation.city;
+
+            // 速度計更新
+            var displaySpeed = speed !== null ? Math.round(speed) : (isDemoPlaying ? Math.floor(75 + Math.sin(km) * 12) : 0);
+            var uiSpd = document.getElementById("ui-speed");
+            if (uiSpd) uiSpd.innerText = displaySpeed;
+
+            // 地図マーカー＆方位角の同期（手動操作をしていない場合のみ、地図中心を自動追従）
+            if (map && trainMarker) {
+                trainMarker.setLatLng(coords);
+                
+                var mapPane = document.querySelector('.rotated-map .leaflet-map-pane');
+                if (mapPane) {
+                    mapPane.style.transform = `rotate(${-bearing}deg)`;
+                }
+
+                var markerIcons = document.querySelectorAll('.rotated-map .leaflet-marker-icon .fix-rotate');
+                markerIcons.forEach(function(icon) {
+                    icon.style.transform = `rotate(${bearing}deg)`;
+                });
+
+                // 自動追従が有効な場合のみsetViewを実行
+                if (!isMapUserInteracting) {
+                    map.setView(coords, map.getZoom(), { animate: false });
+                }
+            }
+
+            // 沿線スポット ハイライト＆自動スライド（km範囲対応：範囲内=接近とみなす）
+            var closestSpotId = null;
+            var minDiff = Infinity;
+
+            SPOT_IDS.forEach(function(id) {
+                var s = SPOTS[parseInt(id.split("-")[1], 10)];
+                var card = document.getElementById("card-" + id);
+                if (!card || !s) return;
+                // 現在 km と範囲 [kmStart,kmEnd] の距離（範囲内は0）
+                var diff = (km >= s.kmStart && km <= s.kmEnd) ? 0
+                           : Math.min(Math.abs(km - s.kmStart), Math.abs(km - s.kmEnd));
+                if (diff < minDiff) { minDiff = diff; closestSpotId = "card-" + id; }
+
+                if (diff < 2.5) {
+                    card.className = "snap-center shrink-0 w-[210px] bg-appCard border border-blue-500 rounded-xl p-2.5 flex flex-col justify-between transition-all duration-300 scale-[1.02] opacity-100 relative group shadow-[0_0_12px_rgba(59,130,246,0.3)]";
+                } else {
+                    card.className = "snap-center shrink-0 w-[210px] bg-appCard border border-appBorder rounded-xl p-2.5 flex flex-col justify-between transition-all duration-300 opacity-80 relative group shadow-md shadow-slate-950/40";
+                }
+            });
+
+            // 近くにスポットがあれば、横スクロールコンテナを自動スライド
+            if (closestSpotId && minDiff < 3.0) {
+                var activeCard = document.getElementById(closestSpotId);
+                var container = document.getElementById("scenic-card-container");
+                if (activeCard && container) {
+                    var cardLeft = activeCard.offsetLeft;
+                    var cardWidth = activeCard.clientWidth;
+                    var containerWidth = container.clientWidth;
+                    container.scrollTo({
+                        left: cardLeft - (containerWidth / 2) + (cardWidth / 2),
+                        behavior: 'smooth'
+                    });
+                }
+            }
+
+            // 💡 停車駅タイムラインの同期＆ズレ・停車時の丸ドットへの重ね合わせ処理
+            document.querySelectorAll(".station-row").forEach(function(el) { 
+                el.classList.add("opacity-35");
+                el.classList.remove("opacity-60", "opacity-100");
+                var nameEl = el.querySelector(".station-name");
+                if (nameEl) nameEl.className = "station-name text-slate-300 font-bold text-xs pl-8";
+                
+                // 丸ドットを元のデフォルト状態にリセット
+                var dot = el.querySelector(".absolute.left-\\[12px\\]");
+                if (dot) {
+                    dot.className = "absolute left-[12px] -translate-x-1/2 w-2 h-2 rounded-full bg-slate-700 z-10 border border-appDark";
+                    dot.innerHTML = "";
+                }
+            });
+            document.querySelectorAll(".section-row").forEach(function(el) { el.classList.add("hidden"); });
+
+            stations.forEach(function(st) {
+                var el = document.getElementById(`station-${st.id}`);
+                if (el && st.km < km) {
+                    el.classList.remove("opacity-35");
+                    el.classList.add("opacity-60");
+                }
+            });
+
+            // 停車時は該当駅の●の部分の真上に現在地マーク（ナビ矢印）を配置する処理
+            if (stoppedAtStation) {
+                var row = document.getElementById(`station-${stoppedAtStation.id}`);
+                if (row) {
+                    var dot = row.querySelector(".absolute.left-\\[12px\\]");
+                    if (dot) {
+                        // 丸ドット自体を脈動するナビ矢印に綺麗に置換して、ズレなく「ドットの真上」に表示
+                        dot.className = "absolute left-[12px] -translate-x-1/2 w-4 h-4 flex items-center justify-center z-10 current-location-pulse";
+                        dot.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="#2563eb" style="display:block;filter:drop-shadow(0 0 3px rgba(37,99,235,0.6))"><path d="M12 22 L4 5 L12 12 L20 5 Z"/></svg>`;
+                    }
+                }
+            } else {
+                // 走行中は駅間のセクションに完璧にナビ矢印を表示
+                var activeSection = document.getElementById(`section-${prevStation.id}-${nextStation.id}`);
+                if (activeSection) {
+                    activeSection.classList.remove("hidden");
+                }
+
+                var prevRow = document.getElementById(`station-${prevStation.id}`);
+                var nextRow = document.getElementById(`station-${nextStation.id}`);
+                if (prevRow) {
+                    prevRow.classList.remove("opacity-35", "opacity-60");
+                    prevRow.classList.add("opacity-100");
+                    var prevName = prevRow.querySelector(".station-name");
+                    if (prevName) prevName.className = "station-name text-blue-400 font-black text-xs pl-8";
+                }
+                if (nextRow) {
+                    nextRow.classList.remove("opacity-35", "opacity-60");
+                    nextRow.classList.add("opacity-100");
+                    var nextName = nextRow.querySelector(".station-name");
+                    if (nextName) nextName.className = "station-name text-blue-400 font-black text-xs pl-8";
+                }
+            }
+
+            // タイムライン自動スクロール追従
+            var targetScrollRowId = stoppedAtStation ? `station-${stoppedAtStation.id}` : `station-${nextStation.id}`;
+            var activeScrollElement = document.getElementById(targetScrollRowId);
+            
+            if (activeScrollElement) {
+                requestAnimationFrame(function() {
+                    var container = document.getElementById("station-timeline-container");
+                    if (container) {
+                        var offset = activeScrollElement.offsetTop;
+                        var containerHeight = container.clientHeight;
+                        var elementHeight = activeScrollElement.clientHeight;
+                        container.scrollTo({
+                            top: offset - (containerHeight / 2) + (elementHeight / 2),
+                            behavior: 'smooth'
+                        });
+                    }
+                });
+            }
+        }
+
+        // 💡 スポット個別カードの詳細表示切替 (縦方向にのみスッと伸びるよう、横幅変更ロジックを完全に排除)
+        function toggleCardDetails(id) {
+            var shortDesc = document.getElementById(`desc-${id}-short`);
+            var detailDesc = document.getElementById(`desc-${id}-detail`);
+            var label = document.getElementById(`label-${id}`);
+            var icon = document.getElementById(`icon-${id}`);
+            var card = document.getElementById(`card-${id}`);
+
+            if (detailDesc.classList.contains("hidden")) {
+                // 詳細を開く
+                detailDesc.classList.remove("hidden");
+                if (shortDesc) shortDesc.classList.add("hidden");
+                label.innerText = "折りたたむ";
+                icon.className = "fa-solid fa-caret-up"; // caret-upに修正
+                
+                // 横幅の変更クラス操作をすべて削除。w-[210px]のまま縦方向のみ綺麗に伸縮します
+
+                // 一括格納バーを表示
+                document.getElementById("collapse-all-bar").classList.remove("hidden");
+                document.getElementById("collapse-all-bar").classList.add("flex");
+            } else {
+                // 詳細を閉じる
+                detailDesc.classList.add("hidden");
+                if (shortDesc) shortDesc.classList.remove("hidden");
+                label.innerText = "詳細を見る";
+                icon.className = "fa-solid fa-caret-down"; // caret-downに修正
+                
+                // 横幅の変更クラス操作をすべて削除
+
+                checkAnyCardExpanded();
+            }
+
+            // 中央寄せスライド
+            var container = document.getElementById("scenic-card-container");
+            if (container && card) {
+                setTimeout(function() {
+                    container.scrollTo({
+                        left: card.offsetLeft - (container.clientWidth / 2) + (card.clientWidth / 2),
+                        behavior: 'smooth'
+                    });
+                }, 100);
+            }
+        }
+
+        // すべてのスポットカードを縦方向に折りたたんで格納する
+        function collapseAllScenicCards() {
+            SPOT_IDS.forEach(function(id) {
+                var shortDesc = document.getElementById(`desc-${id}-short`);
+                var detailDesc = document.getElementById(`desc-${id}-detail`);
+                var label = document.getElementById(`label-${id}`);
+                var icon = document.getElementById(`icon-${id}`);
+
+                if (detailDesc && !detailDesc.classList.contains("hidden")) {
+                    detailDesc.classList.add("hidden");
+                    if (shortDesc) shortDesc.classList.remove("hidden");
+                    if (label) label.innerText = "詳細を見る";
+                    if (icon) icon.className = "fa-solid fa-caret-down";
+                }
+            });
+
+            document.getElementById("collapse-all-bar").classList.add("hidden");
+            document.getElementById("collapse-all-bar").classList.remove("flex");
+        }
+
+        // 他に開いているカードがないか確認し、一括格納バーの表示状態を制御
+        function checkAnyCardExpanded() {
+            var anyExpanded = false;
+            SPOT_IDS.forEach(function(id) {
+                var detailDesc = document.getElementById(`desc-${id}-detail`);
+                if (detailDesc && !detailDesc.classList.contains("hidden")) {
+                    anyExpanded = true;
+                }
+            });
+
+            var bar = document.getElementById("collapse-all-bar");
+            if (!anyExpanded && bar) {
+                bar.classList.add("hidden");
+                bar.classList.remove("flex");
+            }
+        }
+
+        // 💡 地図のドラッグ操作時に追従モードを一時解除する仕組み
+        function setupMapInteractionListeners() {
+            if (!map) return;
+
+            // ドラッグ開始、ズーム開始等のイベント検知
+            map.on('movestart', function(e) {
+                if (map._touchActive || map._dragActive || e.gesture) {
+                    triggerUserInteraction(true);
+                }
+            });
+
+            // コンテナのスクロールやタッチダウン
+            var mapContainer = document.getElementById('map');
+            mapContainer.addEventListener('mousedown', function() { triggerUserInteraction(true); });
+            mapContainer.addEventListener('touchstart', function() { triggerUserInteraction(true); });
+        }
+
+        function triggerUserInteraction(state) {
+            isMapUserInteracting = state;
+            var warningPulse = document.getElementById("tracking-warning-pulse");
+            
+            if (state) {
+                // 追従解除状態: コンパス部分の警告枠を輝かせる
+                if (warningPulse) warningPulse.classList.add("opacity-100");
+            } else {
+                if (warningPulse) warningPulse.classList.remove("opacity-100");
+            }
+        }
+
+        // 💡 追従解除した地図を、再び現在地に吸着させて回転をリセットする機能 (トースト通知は不要のため削除)
+        function resetMapTracking() {
+            if (!map) return;
+            
+            triggerUserInteraction(false);
+
+            // 最新のKMから座標と角度を取得してセット
+            var state = getCoordsByKm(currentKm);
+            map.setView([state.lat, state.lng], 14, { animate: true });
+        }
+
+        // モード変更
+        function setMode(mode) {
+            currentMode = mode;
+            
+            var btnGps = document.getElementById("toggle-gps");
+            var btnDemo = document.getElementById("toggle-demo");
+            var demoCtrl = document.getElementById("demo-ctrl-bar");
+            var gpsBadge = document.getElementById("ui-gps-badge");
+
+            if (mode === "gps") {
+                btnGps.className = "px-2.5 py-0.5 rounded font-bold transition-all bg-railBlue text-white shadow";
+                btnDemo.className = "px-2.5 py-0.5 rounded font-bold transition-all text-slate-400";
+                demoCtrl.style.display = "none";
+                if (gpsBadge) {
+                    gpsBadge.innerText = "測位中";
+                    gpsBadge.className = "text-[8px] font-bold text-amber-400 bg-amber-500/5 border border-amber-500/10 px-1 rounded w-full mt-0.5 text-center leading-none";
+                }
+                
+                stopDemo();
+                startGPSWatch();
+            } else {
+                btnGps.className = "px-2.5 py-0.5 rounded font-bold transition-all text-slate-400";
+                btnDemo.className = "px-2.5 py-0.5 rounded font-bold transition-all bg-railBlue text-white shadow";
+                demoCtrl.style.display = "flex";
+                if (gpsBadge) {
+                    gpsBadge.innerText = "デモ";
+                    gpsBadge.className = "text-[8px] font-bold text-blue-400 bg-blue-500/5 border border-blue-500/10 px-1 rounded w-full mt-0.5 text-center leading-none";
+                }
+
+                stopGPSWatch();
+                onDemoSliderChange(document.getElementById("demo-slider").value);
+            }
+        }
+
+        // GPS監視
+        function startGPSWatch() {
+            if (!navigator.geolocation) {
+                showToast("GPS非対応デバイスです。デモに戻ります。", "error");
+                setMode("demo");
+                return;
+            }
+
+            showToast("GPS測位を開始します。屋外で使用すると正確な位置を示します。");
+
+            watchId = navigator.geolocation.watchPosition(
+                function(position) {
+                    var lat = position.coords.latitude;
+                    var lng = position.coords.longitude;
+                    var rawSpeed = position.coords.speed;
+                    var speedKmh = rawSpeed ? rawSpeed * 3.6 : null;
+
+                    var matched = mapMatchToTrack(lat, lng);
+                    
+                    var gpsBadge = document.getElementById("ui-gps-badge");
+                    if (gpsBadge) {
+                        gpsBadge.innerText = "GPS有効";
+                        gpsBadge.className = "text-[8px] font-bold text-emerald-400 bg-emerald-500/5 border border-emerald-500/10 px-1 rounded w-full mt-0.5 text-center leading-none";
+                    }
+
+                    updateAppStatus(matched.km, [matched.lat, matched.lng], matched.bearing, speedKmh);
+                },
+                function(error) {
+                    var errorMsg = "GPS取得エラー";
+                    switch(error.code) {
+                        case error.PERMISSION_DENIED:
+                            errorMsg = "位置情報の利用許可がありません。";
+                            break;
+                        case error.POSITION_UNAVAILABLE:
+                            errorMsg = "位置が検出できません。";
+                            break;
+                        case error.TIMEOUT:
+                            errorMsg = "位置情報の取得中にタイムアウトしました。";
+                            break;
+                    }
+                    showToast(errorMsg + " デモモードに切り替えます。", "error");
+                    setMode("demo");
+                },
+                {
+                    enableHighAccuracy: true,
+                    maximumAge: 1000,
+                    timeout: 10000
+                }
+            );
+        }
+
+        function stopGPSWatch() {
+            if (watchId !== null) {
+                navigator.geolocation.clearWatch(watchId);
+                watchId = null;
+            }
+        }
+
+        // デモ再生
+        function toggleDemoPlay() {
+            var btn = document.getElementById("btn-play-demo");
+            var icon = document.getElementById("icon-play-demo");
+            
+            if (isDemoPlaying) {
+                stopDemo();
+            } else {
+                isDemoPlaying = true;
+                icon.className = "fa-solid fa-pause text-[9px] text-white";
+                btn.className = "w-6 h-6 bg-railRed rounded-full flex items-center justify-center hover:scale-105 active:scale-95 transition-all";
+                
+                demoPlayInterval = setInterval(function() {
+                    var km = parseFloat(document.getElementById("demo-slider").value);
+                    km += 0.15;
+                    if (km > 85.7) {
+                        km = 0;
+                    }
+                    document.getElementById("demo-slider").value = km.toFixed(1);
+                    onDemoSliderChange(km);
+                }, 200);
+            }
+        }
+
+        function stopDemo() {
+            isDemoPlaying = false;
+            if (demoPlayInterval) {
+                clearInterval(demoPlayInterval);
+                demoPlayInterval = null;
+            }
+            var btn = document.getElementById("btn-play-demo");
+            var icon = document.getElementById("icon-play-demo");
+            if (btn && icon) {
+                icon.className = "fa-solid fa-play text-[9px] text-white";
+                btn.className = "w-6 h-6 bg-railBlue rounded-full flex items-center justify-center hover:scale-105 active:scale-95 transition-all";
+            }
+        }
+
+        function onDemoSliderChange(value) {
+            var km = parseFloat(value);
+            document.getElementById("demo-km-label").innerText = `${km.toFixed(1)}km`;
+            
+            var state = getCoordsByKm(km);
+            updateAppStatus(km, [state.lat, state.lng], state.bearing);
+        }
+
+        // 初期ロード
+        document.addEventListener("DOMContentLoaded", function() {
+            initTimeline();
+
+            // 地図ビュー
+            map = L.map('map', {
+                zoomControl: false,
+                attributionControl: false,
+                scrollWheelZoom: true,
+                dragging: true,
+                touchZoom: true
+            }).setView([35.906222, 139.623889], 14);
+
+            L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+                maxZoom: 19
+            }).addTo(map);
+
+            // 超精密ポリライン全線の描画
+            var trackCoords = trackPoints.map(function(p) { return [p.lat, p.lng]; });
+            L.polyline(trackCoords, {
+                color: '#e60012',
+                weight: 4.5,
+                opacity: 0.85,
+                lineJoin: 'round'
+            }).addTo(map);
+
+            // 現在地ブルードット
+            var blueDotIcon = L.divIcon({
+                html: `
+                <div class="fix-rotate relative w-6 h-6 flex items-center justify-center">
+                    <div class="absolute w-5 h-5 bg-blue-500 rounded-full opacity-35 animate-ping"></div>
+                    <div class="relative w-3.5 h-3.5 bg-blue-600 rounded-full border-2 border-white shadow-[0_0_8px_rgba(59,130,246,0.9)] z-10"></div>
+                </div>`,
+                className: '',
+                iconSize: [24, 24],
+                iconAnchor: [12, 12]
+            });
+            trainMarker = L.marker([35.906222, 139.623889], { icon: blueDotIcon }).addTo(map);
+
+            // 沿線スポット（地図ピン＋カード）を SPOTS 配列から自動生成
+            renderSpotMarkers();
+            renderSpotCards();
+
+            // 手動ドラッグによる自動追従一時解除機能のセットアップ
+            setupMapInteractionListeners();
+
+            // 初期位置を東京駅にセットして初期化
+            setMode("demo");
+        });
+    </script>
+</body>
+</html>
